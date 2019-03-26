@@ -33,6 +33,9 @@ import com.facebook.presto.parquet.ParquetCorruptionException;
 import com.facebook.presto.parquet.ParquetDataSource;
 import com.facebook.presto.parquet.RichColumnDescriptor;
 import com.facebook.presto.parquet.cache.ParquetMetadataSource;
+import com.facebook.presto.parquet.crypto.DecryptionPropertiesFactory;
+import com.facebook.presto.parquet.crypto.FileDecryptionProperties;
+import com.facebook.presto.parquet.crypto.InternalFileDecryptor;
 import com.facebook.presto.parquet.predicate.Predicate;
 import com.facebook.presto.parquet.predicate.TupleDomainParquetPredicate;
 import com.facebook.presto.parquet.reader.ColumnIndexStoreImpl;
@@ -230,7 +233,14 @@ public class ParquetPageSourceFactory
         try {
             FSDataInputStream inputStream = hdfsEnvironment.getFileSystem(user, path, configuration).openFile(path, hiveFileContext);
             dataSource = buildHdfsParquetDataSource(inputStream, path, stats);
-            ParquetMetadata parquetMetadata = parquetMetadataSource.getParquetMetadata(inputStream, dataSource.getId(), fileSize, hiveFileContext.isCacheable()).getParquetMetadata();
+
+            FileDecryptionProperties fileDecryptionProperties = createDecryptionProperties(path, configuration);
+            InternalFileDecryptor fileDecryptor = null;
+            if (fileDecryptionProperties != null) {
+                fileDecryptor = new InternalFileDecryptor(fileDecryptionProperties);
+            }
+
+            ParquetMetadata parquetMetadata = parquetMetadataSource.getParquetMetadata(inputStream, dataSource.getId(), fileSize, hiveFileContext.isCacheable(), fileDecryptionProperties).getParquetMetadata();
 
             if (!columns.isEmpty() && columns.stream().allMatch(hiveColumnHandle -> hiveColumnHandle.getColumnType() == AGGREGATED)) {
                 return new AggregatedParquetPageSource(columns, parquetMetadata, typeManager, functionResolution);
@@ -279,6 +289,7 @@ public class ParquetPageSourceFactory
                     maxReadBlockSize,
                     batchReaderEnabled,
                     verificationEnabled,
+                    fileDecryptor,
                     parquetPredicate,
                     blockIndexStores,
                     readColumnIndexFilter);
@@ -527,5 +538,20 @@ public class ParquetPageSourceFactory
             return getSubfieldType(messageType, pushedDownSubfield.getRootName(), nestedColumnPath(pushedDownSubfield));
         }
         return getParquetType(prestoType, messageType, useParquetColumnNames, column, tableName, path);
+    }
+
+    /**
+     * This method create FileDecryptionProperties objects based user provided
+     * @param file the file path
+     * @param hadoopConfig Configuration
+     * @return
+     */
+    private static FileDecryptionProperties createDecryptionProperties(Path file, Configuration hadoopConfig)
+    {
+        DecryptionPropertiesFactory cryptoFactory = DecryptionPropertiesFactory.loadFactory(hadoopConfig);
+        if (null == cryptoFactory) {
+            return null;
+        }
+        return cryptoFactory.getFileDecryptionProperties(hadoopConfig, file);
     }
 }

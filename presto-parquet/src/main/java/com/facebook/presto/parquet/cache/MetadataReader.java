@@ -15,6 +15,11 @@ package com.facebook.presto.parquet.cache;
 
 import com.facebook.presto.parquet.ParquetCorruptionException;
 import com.facebook.presto.parquet.ParquetDataSourceId;
+import com.facebook.presto.parquet.crypto.AesCipher;
+import com.facebook.presto.parquet.crypto.FileDecryptionProperties;
+import com.facebook.presto.parquet.crypto.InternalFileDecryptor;
+import com.facebook.presto.parquet.format.BlockCipher.Decryptor;
+import io.airlift.slice.BasicSliceInput;
 import io.airlift.slice.Slice;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
@@ -23,6 +28,7 @@ import org.apache.parquet.format.ColumnChunk;
 import org.apache.parquet.format.ColumnMetaData;
 import org.apache.parquet.format.ConvertedType;
 import org.apache.parquet.format.Encoding;
+import org.apache.parquet.format.FileCryptoMetaData;
 import org.apache.parquet.format.FileMetaData;
 import org.apache.parquet.format.KeyValue;
 import org.apache.parquet.format.RowGroup;
@@ -56,40 +62,36 @@ import java.util.Map;
 import java.util.Set;
 
 import static com.facebook.presto.parquet.ParquetValidationUtils.validateParquet;
+import static com.facebook.presto.parquet.format.Util.readFileCryptoMetaData;
+import static com.facebook.presto.parquet.format.Util.readFileMetaData;
 import static io.airlift.slice.Slices.wrappedBuffer;
 import static java.lang.Math.min;
 import static java.lang.Math.toIntExact;
 import static java.lang.String.format;
 import static java.nio.charset.StandardCharsets.US_ASCII;
-import static org.apache.parquet.format.Util.readFileMetaData;
 
 public final class MetadataReader
         implements ParquetMetadataSource
 {
     private static final Slice MAGIC = wrappedBuffer("PAR1".getBytes(US_ASCII));
+    private static final Slice EMAGIC = wrappedBuffer("PARE".getBytes(US_ASCII));
     private static final int POST_SCRIPT_SIZE = Integer.BYTES + MAGIC.length();
     private static final int EXPECTED_FOOTER_SIZE = 16 * 1024;
     private static final ParquetMetadataConverter PARQUET_METADATA_CONVERTER = new ParquetMetadataConverter();
 
-    public static ParquetFileMetadata readFooter(FileSystem fileSystem, Path file, long fileSize)
+    public static ParquetFileMetadata readFooter(FileSystem fileSystem, Path file, long fileSize, FileDecryptionProperties fileDecryptionProperties)
             throws IOException
     {
         try (FSDataInputStream inputStream = fileSystem.open(file)) {
-            return readFooter(inputStream, file, fileSize);
+            return readFooter(inputStream, file, fileSize, fileDecryptionProperties);
         }
     }
 
-    public static ParquetFileMetadata readFooter(FSDataInputStream inputStream, Path file, long fileSize)
+    public static ParquetFileMetadata readFooter(FSDataInputStream inputStream, Path file, long fileSize, FileDecryptionProperties fileDecryptionProperties)
             throws IOException
 
     {
-        // Parquet File Layout:
-        //
-        // MAGIC
-        // variable: Data
-        // variable: Metadata
-        // 4 bytes: MetadataLength
-        // MAGIC
+        // Parquet File Layout: https://github.com/apache/parquet-format/blob/master/Encryption.md
 
         validateParquet(fileSize >= MAGIC.length() + POST_SCRIPT_SIZE, "%s is not a valid Parquet File", file);
 
@@ -99,8 +101,16 @@ public final class MetadataReader
         Slice tailSlice = wrappedBuffer(buffer);
 
         Slice magic = tailSlice.slice(tailSlice.length() - MAGIC.length(), MAGIC.length());
-        if (!MAGIC.equals(magic)) {
-            throw new ParquetCorruptionException(format("Not valid Parquet file: %s expected magic number: %s got: %s", file, Arrays.toString(MAGIC.getBytes()), Arrays.toString(magic.getBytes())));
+
+        boolean encryptedFooterMode;
+        if (MAGIC.equals(magic)) {
+            encryptedFooterMode = false;
+        }
+        else if (MAGIC.equals(magic)) {
+            encryptedFooterMode = true;
+        }
+        else {
+            throw new ParquetCorruptionException(format("Not valid Parquet file: %s expected magic number: %s or %s got: %s", file, Arrays.toString(MAGIC.getBytes()), Arrays.toString(EMAGIC.getBytes()), Arrays.toString(magic.getBytes())));
         }
 
         int metadataLength = tailSlice.getInt(tailSlice.length() - POST_SCRIPT_SIZE);
@@ -117,7 +127,31 @@ public final class MetadataReader
             tailSlice = wrappedBuffer(footerBuffer, 0, footerBuffer.length);
         }
 
-        FileMetaData fileMetaData = readFileMetaData(tailSlice.slice(tailSlice.length() - completeFooterSize, metadataLength).getInput());
+        return readParquetMetadata(tailSlice.slice(tailSlice.length() - completeFooterSize, metadataLength).getInput(), file, metadataLength, fileDecryptionProperties, encryptedFooterMode);
+    }
+
+    private static ParquetFileMetadata readParquetMetadata(BasicSliceInput input, Path file, int metadataLength, FileDecryptionProperties fileDecryptionProperties, boolean encryptedFooterMode)
+            throws IOException
+    {
+        if (encryptedFooterMode && fileDecryptionProperties == null) {
+            new IllegalArgumentException("fileDecryptionProperties cannot be null when encryptedFooterMode is true");
+        }
+        InternalFileDecryptor fileDecryptor = (fileDecryptionProperties == null) ? null : new InternalFileDecryptor(fileDecryptionProperties);
+        Decryptor footerDecryptor = encryptedFooterMode ? fileDecryptor.fetchFooterDecryptor() : null;
+        byte[] aad = encryptedFooterMode ? AesCipher.createFooterAad(fileDecryptor.getFileAAD()) : null;
+
+        if (encryptedFooterMode) {
+            FileCryptoMetaData fileCryptoMetaData = readFileCryptoMetaData(input);
+            fileDecryptor.setFileCryptoMetaData(fileCryptoMetaData.getEncryption_algorithm(), true, fileCryptoMetaData.getKey_metadata());
+        }
+
+        FileMetaData fileMetaData = readFileMetaData(input, footerDecryptor, aad);
+        return convertToParquetMetadata(fileMetaData, file, metadataLength);
+    }
+
+    private static ParquetFileMetadata convertToParquetMetadata(FileMetaData fileMetaData, Path file, int metadataLength)
+            throws IOException
+    {
         List<SchemaElement> schema = fileMetaData.getSchema();
         validateParquet(!schema.isEmpty(), "Empty Parquet schema in file: %s", file);
 
@@ -315,10 +349,10 @@ public final class MetadataReader
     }
 
     @Override
-    public ParquetFileMetadata getParquetMetadata(FSDataInputStream inputStream, ParquetDataSourceId parquetDataSourceId, long fileSize, boolean cacheable)
+    public ParquetFileMetadata getParquetMetadata(FSDataInputStream inputStream, ParquetDataSourceId parquetDataSourceId, long fileSize, boolean cacheable, FileDecryptionProperties fileDecryptionProperties)
             throws IOException
     {
-        return readFooter(inputStream, new Path(parquetDataSourceId.toString()), fileSize);
+        return readFooter(inputStream, new Path(parquetDataSourceId.toString()), fileSize, fileDecryptionProperties);
     }
 
     private static IndexReference toColumnIndexReference(ColumnChunk columnChunk)

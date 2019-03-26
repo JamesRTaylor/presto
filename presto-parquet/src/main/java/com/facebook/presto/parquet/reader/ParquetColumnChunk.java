@@ -19,6 +19,8 @@ import com.facebook.presto.parquet.DataPageV2;
 import com.facebook.presto.parquet.DictionaryPage;
 import com.facebook.presto.parquet.ParquetCorruptionException;
 import com.facebook.presto.parquet.cache.MetadataReader;
+import com.facebook.presto.parquet.format.BlockCipher;
+import com.facebook.presto.parquet.format.Util;
 import io.airlift.slice.Slice;
 import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.column.Encoding;
@@ -26,7 +28,6 @@ import org.apache.parquet.format.DataPageHeader;
 import org.apache.parquet.format.DataPageHeaderV2;
 import org.apache.parquet.format.DictionaryPageHeader;
 import org.apache.parquet.format.PageHeader;
-import org.apache.parquet.format.Util;
 import org.apache.parquet.internal.column.columnindex.OffsetIndex;
 
 import java.io.IOException;
@@ -68,13 +69,14 @@ public class ParquetColumnChunk
         return descriptor;
     }
 
-    protected PageHeader readPageHeader()
+    protected PageHeader readPageHeader(BlockCipher.Decryptor headerBlockDecryptor, byte[] pageHeaderAAD)
             throws IOException
     {
-        return Util.readPageHeader(stream);
+        return Util.readPageHeader(stream, headerBlockDecryptor, pageHeaderAAD);
     }
 
-    public PageReader readAllPages()
+    public PageReader readAllPages(BlockCipher.Decryptor headerBlockDecryptor, BlockCipher.Decryptor pageBlockDecryptor,
+                                   byte[] aadPrefix, int rowGroupOrdinal, int columnOrdinal)
             throws IOException
     {
         List<DataPage> pages = new ArrayList<>();
@@ -82,7 +84,7 @@ public class ParquetColumnChunk
         long valueCount = 0;
         int dataPageCount = 0;
         while (hasMorePages(valueCount, dataPageCount)) {
-            PageHeader pageHeader = readPageHeader();
+            PageHeader pageHeader = readPageHeader(headerBlockDecryptor, aadPrefix);
             int uncompressedPageSize = pageHeader.getUncompressed_page_size();
             int compressedPageSize = pageHeader.getCompressed_page_size();
             long firstRowIndex = -1;
@@ -108,8 +110,8 @@ public class ParquetColumnChunk
                     break;
             }
         }
-
-        return new PageReader(descriptor.getColumnChunkMetaData().getCodec(), pages, dictionaryPage, offsetIndex);
+        return new PageReader(descriptor.getColumnChunkMetaData().getCodec(), pages, dictionaryPage, offsetIndex, descriptor.getColumnDescriptor().getPath(),
+                pageBlockDecryptor, aadPrefix, (short) rowGroupOrdinal, (short) columnOrdinal);
     }
 
     private Slice getSlice(int size) throws IOException
@@ -123,7 +125,7 @@ public class ParquetColumnChunk
         return wrappedBuffer(buffer.array(), buffer.position(), size);
     }
 
-    private DictionaryPage readDictionaryPage(PageHeader pageHeader, int uncompressedPageSize, int compressedPageSize)
+    protected DictionaryPage readDictionaryPage(PageHeader pageHeader, int uncompressedPageSize, int compressedPageSize)
             throws IOException
     {
         DictionaryPageHeader dicHeader = pageHeader.getDictionary_page_header();
@@ -134,11 +136,11 @@ public class ParquetColumnChunk
                 getParquetEncoding(Encoding.valueOf(dicHeader.getEncoding().name())));
     }
 
-    private long readDataPageV1(PageHeader pageHeader,
-            int uncompressedPageSize,
-            int compressedPageSize,
-            long firstRowIndex,
-            List<DataPage> pages)
+    protected long readDataPageV1(PageHeader pageHeader,
+                                int uncompressedPageSize,
+                                int compressedPageSize,
+                                long firstRowIndex,
+                                List<DataPage> pages)
             throws IOException
     {
         DataPageHeader dataHeaderV1 = pageHeader.getData_page_header();
@@ -156,11 +158,11 @@ public class ParquetColumnChunk
         return dataHeaderV1.getNum_values();
     }
 
-    private long readDataPageV2(PageHeader pageHeader,
-            int uncompressedPageSize,
-            int compressedPageSize,
-            long firstRowIndex,
-            List<DataPage> pages)
+    protected long readDataPageV2(PageHeader pageHeader,
+                                int uncompressedPageSize,
+                                int compressedPageSize,
+                                long firstRowIndex,
+                                List<DataPage> pages)
             throws IOException
     {
         DataPageHeaderV2 dataHeaderV2 = pageHeader.getData_page_header_v2();
